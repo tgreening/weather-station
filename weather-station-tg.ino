@@ -49,6 +49,7 @@
 // Download helper
 #include "WebResource.h"
 
+#include <FS.h>                   //this needs to be first, or it all crashes and burns...
 #include <ESP8266WiFi.h>
 #include <ArduinoOTA.h>
 #include <ESP8266mDNS.h>
@@ -67,6 +68,8 @@
 #include <ArduinoJson.h>          //https://github.com/bblanchon/ArduinoJson
 #include "SoftwareSerial.h"
 #include <DFPlayer_Mini_Mp3.h>
+#include <Time.h>
+#include <ESP8266HTTPClient.h>
 
 // HOSTNAME for OTA update
 #define HOSTNAME "AlarmClock"
@@ -97,12 +100,11 @@ SoftwareSerial mySoftwareSerial(D0, D8); // RX, TX
 boolean booted = true;
 const int SYNC_INTERVAL = 3600; //every hour sync the time
 int screen = 0;
-int alarmSettings [10] = {19, 51, 0, 0, 0, 0, 0, 0, 0, 1};
 GfxUi ui = GfxUi(&tft);
 
 WebResource webResource;
-const String _timeZone = "America/Detroit";
-const String _apiKey = "AY0H14VE80X2";
+String timezone;
+String apikey;
 
 // Set to false, if you prefere imperial/inches, Fahrenheit
 WundergroundClient wunderground(false);
@@ -121,13 +123,119 @@ void drawForecastDetail(uint16_t x, uint16_t y, uint8_t dayIndex);
 String getMeteoconIcon(String iconText);
 //void drawAstronomy();
 void drawSeparator(uint16_t y);
+void writeSettingsFile();
+int correctDay();
+time_t getTime();
+void drawAlarmScreen();
 
 long lastDownloadUpdate = millis();
+
+typedef struct alarmStruct {
+  int Hours  = 19;
+  int Minutes = 15;
+  bool Enabled = 1;
+  bool Monday = 1;
+  bool Tuesday = 1;
+  bool Wednesday = 1;
+  bool Thursday = 1;
+  bool Friday = 1;
+  bool Saturday = 0;
+  bool Sunday = 0;
+};
+alarmStruct alarm;
+ESP8266WebServer httpServer(80);
+
+//flag for saving data
+bool shouldSaveConfig = false;
+
+//callback notifying us of the need to save config
+void saveConfigCallback () {
+  Serial.println("Should save config");
+  shouldSaveConfig = true;
+}
 
 void setup() {
 #ifdef SERIAL_MESSAGES
   Serial.begin(115200);
 #endif
+  httpServer.on("/", HTTP_GET, []() {
+    yield();
+    httpServer.sendHeader("Connection", "close");
+    httpServer.sendHeader("Access-Control-Allow-Origin", "*");
+    Serial.println("Serving up HTML...");
+    String checked = " checked ";
+    String html = "<html><body><form method=\"POST\" action=\"/update\">Alarm: <input type=\"text\" name=\"hour\" value=\"" + String(alarm.Hours) + "\">:<input name=\"minute\" type=\"text\" value=\"" + String(alarm.Minutes) + "\"\><br>";
+    html += "<input type=\"checkbox\" name=\"monday\" value=\"1\"";
+    html += alarm.Monday ? checked : "" ;
+    html += ">Monday<br>";
+    html += "<input type=\"checkbox\" name=\"tuesday\" value=\"1\"";
+    html += alarm.Tuesday ? checked : "" ;
+    html += ">Tuesday<br>";
+    html += "<input type=\"checkbox\" name=\"wednesday\" value=\"1\"";
+    html += alarm.Wednesday ? checked : "" ;
+    html += ">Wednesday<br>";
+    html += "<input type=\"checkbox\" name=\"thursday\" value=\"1\"";
+    html += alarm.Thursday ? checked : "" ;
+    html += ">Thursday<br>";
+    html += "<input type=\"checkbox\" name=\"friday\" value=\"1\"";
+    html += alarm.Friday ? checked : "" ;
+    html += ">Friday<br>";
+    html += "<input type=\"checkbox\" name=\"saturday\" value=\"1\"";
+    html += alarm.Saturday ? checked : "" ;
+    html += ">Saturday<br>";
+    html += "<input type=\"checkbox\" name=\"sunday\" value=\"1\"";
+    html += alarm.Sunday ? checked : "" ;
+    html += ">Sunday<br>";
+    html += "<input type=\"checkbox\" name=\"enabled\" value=\"1\">Enabled<br>";
+    html += "<br><INPUT type=\"submit\" value=\"Send\"> <INPUT type=\"reset\"></form>";
+    html += "<br></body></html>";
+    Serial.print("Done serving up HTML...");
+    Serial.println(html);
+    httpServer.send(200, "text/html", html);
+  });
+
+  httpServer.on("/update", HTTP_POST, []() {
+    yield();
+    Serial.println(httpServer.arg("enabled"));
+    if (httpServer.arg("enabled") != "") {
+      alarm.Enabled = httpServer.arg("enabled").toInt();
+    }
+    if (httpServer.arg("hour") != "") {
+      alarm.Hours = httpServer.arg("hour").toInt();
+    }
+    if (httpServer.arg("minute") != "") {
+      alarm.Minutes = httpServer.arg("minute").toInt();
+    }
+    if (httpServer.arg("monday") != "") {
+      alarm.Monday = httpServer.arg("monday").toInt();
+    }
+    if (httpServer.arg("tuesday") != "") {
+      alarm.Tuesday = httpServer.arg("tuesday").toInt();
+    }
+    if (httpServer.arg("wednesday") != "") {
+      alarm.Wednesday = httpServer.arg("wednesday").toInt();
+    }
+    if (httpServer.arg("thursday") != "") {
+      alarm.Thursday = httpServer.arg("thursday").toInt();
+    }
+    if (httpServer.arg("friday") != "") {
+      alarm.Friday = httpServer.arg("friday").toInt();
+    }
+    if (httpServer.arg("saturday") != "") {
+      alarm.Saturday = httpServer.arg("saturday").toInt();
+    }
+    if (httpServer.arg("sunday") != "") {
+      alarm.Sunday = httpServer.arg("sunday").toInt();
+    }
+
+    httpServer.sendHeader("Connection", "close");
+    httpServer.sendHeader("Access - Control - Allow - Origin", "*");
+    writeAlarmsFile();
+    httpServer.send(200, "text / plain", "OK");
+    Serial.println(alarm.Hours);
+    Serial.println(alarm.Hours == 22);
+
+  });
   tft.begin();
   tft.fillScreen(TFT_BLACK);
 
@@ -142,30 +250,143 @@ void setup() {
   //listFiles();
   //Uncomment if you want to erase SPIFFS and update all internet resources, this takes some time!
   //tft.drawString("Formatting SPIFFS, so wait!", 120, 200); SPIFFS.format();
+  //Serial.println("Finished Formatting Spiffs");
 
-  if (SPIFFS.exists("/WU.jpg") == true) ui.drawJpeg("/WU.jpg", 0, 10);
-  if (SPIFFS.exists("/Earth.jpg") == true) ui.drawJpeg("/Earth.jpg", 0, 320 - 56); // Image is 56 pixels high
-  delay(1000);
   tft.drawString("Connecting to WiFi", 120, 200);
   tft.setTextPadding(240); // Pad next drawString() text to full width to over-write old text
+
+  if (SPIFFS.exists("/config.json")) {
+    //file exists, reading and loading
+    Serial.println("reading config file");
+    fs::File configFile = SPIFFS.open("/config.json", "r");
+    if (configFile) {
+      Serial.println("opened config file");
+      size_t size = configFile.size();
+      // Allocate a buffer to store contents of the file.
+      std::unique_ptr<char[]> buf(new char[size]);
+
+      configFile.readBytes(buf.get(), size);
+      DynamicJsonBuffer jsonBuffer;
+      JsonObject& json = jsonBuffer.parseObject(buf.get());
+      json.printTo(Serial);
+      Serial.println("");
+
+      if (json.success()) {
+        Serial.println("\nparsed json");
+        const char* temp = json["timezone"].as<char*>();
+        timezone = String(temp);
+        Serial.println(timezone);
+        temp = json["apikey"].as<char*>();
+        apikey = String(temp);
+        Serial.println(apikey);
+      } else {
+        Serial.println("failed to load json config");
+      }
+      configFile.close();
+    }
+  }
 
   //WiFiManager
   //Local intialization. Once its business is done, there is no need to keep it around
   WiFiManager wifiManager;
   // Uncomment for testing wifi manager
   //wifiManager.resetSettings();
+  Serial.println("Setting up Wifi manager");
+  WiFiManagerParameter custom_api_key("apiKey", "TimezoneDB API Key", apikey.c_str(), 40);
+  WiFiManagerParameter custom_time_zone("timezone", "Timezone", timezone.c_str(), 50);
+  wifiManager.setSaveConfigCallback(saveConfigCallback);
+
+  //add all your parameters here
+  wifiManager.addParameter(&custom_api_key);
+  wifiManager.addParameter(&custom_time_zone);
+
   wifiManager.setAPCallback(configModeCallback);
+  WiFi.hostname(String(HOSTNAME));
 
   //or use this for auto generated name ESP + ChipID
-  wifiManager.autoConnect();
-
+  wifiManager.setConfigPortalTimeout(30);
+  if (!wifiManager.startConfigPortal(HOSTNAME)) {
+    Serial.println("failed to connect and hit timeout");
+    delay(3000);
+    //reset and try again, or maybe put it to deep sleep
+    ESP.reset();
+    delay(5000);
+  }
+  if (SPIFFS.exists("/WU.jpg") == true) ui.drawJpeg("/WU.jpg", 0, 10);
+  if (SPIFFS.exists("/Earth.jpg") == true) ui.drawJpeg("/Earth.jpg", 0, 320 - 56); // Image is 56 pixels high
+  delay(1000);
   //Manual Wifi
   //WiFi.begin(WIFI_SSID, WIFI_PWD);
+
+  if (SPIFFS.begin()) {
+    Serial.println("mounted file system");
+    if (SPIFFS.exists("/alarm.json")) {
+      //file exists, reading and loading
+      Serial.println("reading config file");
+      fs::File configFile = SPIFFS.open("/alarm.json", "r");
+      if (configFile) {
+        Serial.println("opened config file");
+        size_t size = configFile.size();
+        // Allocate a buffer to store contents of the file.
+        std::unique_ptr<char[]> buf(new char[size]);
+
+        configFile.readBytes(buf.get(), size);
+        DynamicJsonBuffer jsonBuffer;
+        JsonObject& json = jsonBuffer.parseObject(buf.get());
+        json.printTo(Serial);
+        Serial.println("");
+        if (json.success()) {
+          Serial.println("\nparsed json");
+          alarm.Enabled = json["enabled"];
+          alarm.Hours = json["hour"];
+          alarm.Minutes = json["minute"];
+          alarm.Monday = json["monday"];
+          alarm.Tuesday = json["tuesday"];
+          alarm.Wednesday = json["wednesday"];
+          alarm.Thursday = json["thursday"];
+          alarm.Friday = json["friday"];
+          alarm.Saturday = json["saturday"];
+          alarm.Sunday = json["sunday"];
+        } else {
+          Serial.println("failed to load json config");
+        }
+      }
+      configFile.close();
+    }
+  } else {
+    Serial.println("failed to mount FS");
+  }
+
+  //save the custom parameters to FS
+  if (shouldSaveConfig) {
+    const char* temp  = custom_api_key.getValue();
+    if (temp != "") apikey = String(temp);
+    Serial.println("apiKey: " + String(apikey));
+    temp  = custom_time_zone.getValue();
+    if (temp != "") timezone = String(temp);
+    Serial.println("timezone: " + String(timezone));
+    Serial.println("saving config");
+    DynamicJsonBuffer jsonBuffer;
+    JsonObject& json = jsonBuffer.createObject();
+    json["timezone"] = timezone;
+    json["apikey"] = apikey;
+
+    fs::File configFile = SPIFFS.open("/config.json", "w");
+    if (!configFile) {
+      Serial.println("failed to open config file for writing");
+    }
+
+    json.printTo(Serial);
+    json.printTo(configFile);
+    Serial.println("");
+    configFile.close();
+    //end save
+  }
 
   // OTA Setup
   String hostname(HOSTNAME);
   WiFi.hostname(hostname);
-  ArduinoOTA.setHostname((const char *)hostname.c_str());
+  ArduinoOTA.setHostname("AlarmClock");
   ArduinoOTA.begin();
 
   // download images from the net. If images already exist don't download
@@ -179,6 +400,12 @@ void setup() {
   tft.drawString(" ", 120, 200);  // Clear line above using set padding width
   tft.drawString("Fetching weather data...", 120, 200);
   //delay(500);
+  time_t check = getTime();
+  Serial.println(check);
+  while (check == 0) {
+    check =  getTime();
+    Serial.println(check);
+  }
   setSyncProvider(getTime);
   setSyncInterval(SYNC_INTERVAL);
   mySoftwareSerial.begin(9600);
@@ -186,35 +413,41 @@ void setup() {
   // Delay is required before accessing player. From my experience it's ~1 sec
   mp3_set_volume(30);
   delay(500);
-
+  Serial.println(WiFi.localIP());
+  WiFi.mode(WIFI_STA);
+  httpServer.begin();
   // load the weather information
   updateData();
 }
 
 long lastDrew = 0;
+
 void loop() {
   // Handle OTA update requests
+  httpServer.handleClient();
   ArduinoOTA.handle();
   uint16_t t_x = 0, t_y = 0; // To store the touch coordinates
   if (screen == MAIN_SCREEN) {
-    if (alarmSettings[day() + 3]) {
-      if (alarmSettings[0] == hour()) {
-        if (alarmSettings[1] == minute()) {
-          screen = ALARM_SCREEN;
+    if (alarm.Hours == hour()) {
+      if (alarm.Minutes == minute()) {
+        Serial.println("Minute correct!");
+        if (alarm.Enabled) {
+          Serial.println("Alarm Enabled");
+          if (correctDay()) {
+            Serial.println("Alarm triggered!");
+            screen = ALARM_SCREEN;
+          }
         }
       }
     }
     // Pressed will be set true is there is a valid touch on the screen
     if ( tft.getTouch(&t_x, &t_y)) {
-      Serial.println("Screen touched....x:" + String(t_x) + " y:" + String(t_y));
-      // tft.fillCircle(t_y, t_x, 2, TFT_BLACK);
-
-      // / Check if any key coordinate boxes contain the touch coordinates
+      //     Serial.println("Screen touched....x: " + String(t_x) + " y: " + String(t_y));
 
       if ( t_x > 0 && t_x < 80 && t_y < 280 && t_y > 80) {
         screen = ALARM_SETTINGS_SCREEN;
         delay(500);
-         mp3_play();
+        mp3_play();
         drawAlarmScreen();
       }
     }
@@ -231,7 +464,7 @@ void loop() {
     }
   } else if (screen == ALARM_SETTINGS_SCREEN) {
     if ( tft.getTouch(&t_x, &t_y)) {
-      Serial.println("Screen touched....x:" + String(t_x) + " y:" + String(t_y));
+      //     Serial.println("Screen touched....x: " + String(t_x) + " y: " + String(t_y));
       // tft.fillCircle(t_y, t_x, 2, TFT_BLACK);
       int DAY_WIDTH = 80;
       int DAY_HEIGHT = 15;
@@ -239,58 +472,76 @@ void loop() {
       int START_Y = 300;
       for (int i = 0; i < 4; i++) {
         if (t_x < START_X  && t_x > START_X - DAY_HEIGHT  && t_y < START_Y - DAY_WIDTH * i && t_y > START_Y - DAY_WIDTH * (i + 1)) {
-          if (alarmSettings[i + 3]) {
-            alarmSettings[i + 3] = 0;
-          } else {
-            alarmSettings[i + 3] = 1;
+          switch (i) {
+            case 0:
+              alarm.Monday = !alarm.Monday;
+              break;
+            case 1:
+              alarm.Tuesday = !alarm.Tuesday;
+              break;
+            case 2:
+              alarm.Wednesday = !alarm.Wednesday;
+              break;
+            case 3:
+              alarm.Thursday = !alarm.Thursday;
+              break;
           }
-          Serial.println(String(i) + " pressed");
-          delay(500);
         }
-      }
-      DAY_WIDTH = 80;
-      START_X = 190;
-      START_Y = 250;
-      for (int i = 0; i < 3; i++) {
-        if (t_x < START_X  && t_x > START_X - DAY_HEIGHT  && t_y < START_Y - DAY_WIDTH * i && t_y > START_Y - DAY_WIDTH * (i + 1)) {
-          if (alarmSettings[i + 7]) {
-            alarmSettings[i + 7] = 0;
-          } else {
-            alarmSettings[i + 7] = 1;
+        DAY_WIDTH = 80;
+        START_X = 190;
+        START_Y = 250;
+        for (int i = 0; i < 3; i++) {
+          if (t_x < START_X  && t_x > START_X - DAY_HEIGHT  && t_y < START_Y - DAY_WIDTH * i && t_y > START_Y - DAY_WIDTH * (i + 1)) {
+            switch (i) {
+              case 0:
+                alarm.Friday = !alarm.Friday;
+                break;
+              case 1:
+                alarm.Saturday = !alarm.Saturday;
+                break;
+              case 2:
+                alarm.Sunday = !alarm.Sunday;
+                break;
+            }
+            Serial.println(String(i) + " pressed");
+            delay(500);
           }
-          Serial.println(String(i) + " pressed");
-          delay(500);
         }
-      }
-      DAY_HEIGHT = 20;
-      DAY_WIDTH = 60;
-      START_X = 240;
-      START_Y = 210;
-      for (int i = 0; i < 3; i++) {
-        if (t_x < START_X  && t_x > START_X - DAY_HEIGHT  && t_y < START_Y - DAY_WIDTH * i && t_y > START_Y - DAY_WIDTH * (i + 1)) {
-          alarmSettings[i] ++;
-          if (i == 0 && alarmSettings[0] > 23) {
-            alarmSettings[0] = 0;
-          } else if (i == 1 && alarmSettings[1] > 59) {
-            alarmSettings[1] = 0;
+        DAY_HEIGHT = 20;
+        DAY_WIDTH = 60;
+        START_X = 240;
+        START_Y = 210;
+        for (int i = 0; i < 3; i++) {
+          if (t_x < START_X  && t_x > START_X - DAY_HEIGHT  && t_y < START_Y - DAY_WIDTH * i && t_y > START_Y - DAY_WIDTH * (i + 1)) {
+            if (i == 0) {
+              alarm.Hours++;
+              if (alarm.Hours > 23) {
+                alarm.Hours = 0;
+              }
+
+            } else if (i == 1) {
+              alarm.Minutes++;
+              if (alarm.Minutes > 59) {
+                alarm.Minutes = 0;
+              }
+            }
+            Serial.println(String(i) + " pressed");
+            delay(500);
           }
-          Serial.println(String(i) + " pressed");
-          delay(500);
         }
-      }
-      drawAlarmScreen();
-      if ( t_x > 0 && t_x < 80 && t_y < 280 && t_y > 80) {
-        screen = MAIN_SCREEN;
-        tft.fillScreen(TFT_BLACK);
-        delay(500);
-        updateData();
+        if ( t_x > 0 && t_x < 80 && t_y < 280 && t_y > 80) {
+          screen = MAIN_SCREEN;
+          tft.fillScreen(TFT_BLACK);
+          delay(500);
+          updateData();
+        }
       }
     }
 
   } else if (screen == ALARM_SCREEN) {
-    if (alarmSettings[day() + 3]) {
-      if (alarmSettings[0] == hour()) {
-        if (alarmSettings[1] == minute()) {
+    if (correctDay()) {
+      if (alarm.Hours == hour()) {
+        if (alarm.Minutes == minute()) {
           tft.fillScreen(TFT_RED);
           delay(500);
           tft.fillScreen(TFT_GREEN);
@@ -306,7 +557,7 @@ void loop() {
 }
 
 // Called if WiFi has not been configured yet
-void configModeCallback (WiFiManager *myWiFiManager) {
+void configModeCallback (WiFiManager * myWiFiManager) {
   tft.setTextDatum(BC_DATUM);
   tft.setFreeFont(&ArialRoundedMTBold_14);
   tft.setTextColor(TFT_ORANGE);
@@ -332,8 +583,8 @@ void downloadCallback(String filename, int16_t bytesDownloaded, int16_t bytesTot
   }
   if (percentage % 5 == 0) {
     tft.setTextDatum(TC_DATUM);
-    tft.setTextPadding(tft.textWidth(" 888% "));
-    tft.drawString(String(percentage) + "%", 120, 245);
+    tft.setTextPadding(tft.textWidth(" 888 % "));
+    tft.drawString(String(percentage) + " % ", 120, 245);
     ui.drawProgressBar(10, 225, 240 - 20, 15, percentage, TFT_WHITE, TFT_BLUE);
   }
 
@@ -359,7 +610,7 @@ void drawTime() {
   if (hr_24 > 12 ) {
     AM_PM = "PM";
   }
-  sprintf(buff, "%2d:%02d %2s", hr_12, minute(), AM_PM);
+  sprintf(buff, " %2d:%02d %2s", hr_12, minute(), AM_PM);
 
   String timeNow = String(buff);
 
@@ -371,8 +622,8 @@ void drawTime() {
   tft.setFreeFont(&ArialRoundedMTBold_14);
   char buff2[32];
   char buff3[8];
-  sprintf(buff3, "%s, ", dayStr(weekday()));
-  sprintf(buff2, "%s %2d %4d", monthStr(month()), day(), year());
+  sprintf(buff3, " % s, ", dayStr(weekday()));
+  sprintf(buff2, " % s % 2d % 4d", monthStr(month()), day(), year());
   String date = String(buff3) + String(buff2);
 
   tft.setTextDatum(BC_DATUM);
@@ -419,11 +670,11 @@ void drawCurrentWeather() {
   tft.setTextColor(TFT_ORANGE, TFT_BLACK);
 
   // Font ASCII code 96 (0x60) modified to make "`" a degree symbol
-  tft.setTextPadding(tft.textWidth("-88`")); // Max width of vales
+  tft.setTextPadding(tft.textWidth(" - 88`")); // Max width of vales
 
   weatherText = wunderground.getCurrentTemp();
   if (weatherText.indexOf(".")) weatherText = weatherText.substring(0, weatherText.indexOf(".")); // Make it integer temperature
-  if (weatherText == "") weatherText = "?";  // Handle null return
+  if (weatherText == "") weatherText = " ? ";  // Handle null return
   tft.drawString(weatherText + "`", 221, 100);
 
   tft.setFreeFont(&ArialRoundedMTBold_14);
@@ -508,7 +759,7 @@ void drawForecastDetail(uint16_t x, uint16_t y, uint8_t dayIndex) {
   tft.drawString(day, x + 25, y);
 
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextPadding(tft.textWidth("-88   -88"));
+  tft.setTextPadding(tft.textWidth(" - 88   - 88"));
   tft.drawString(wunderground.getForecastHighTemp(dayIndex) + "   " + wunderground.getForecastLowTemp(dayIndex), x + 25, y + 14);
 
   String weatherIcon = getMeteoconIcon(wunderground.getForecastIcon(dayIndex));
@@ -537,7 +788,7 @@ void drawAlarmScreen() {
   char buff[5];
   int hr_24, hr_12;
   char* AM_PM = "AM";
-  hr_24 = alarmSettings[0];
+  hr_24 = alarm.Hours;
 
   if (hr_24 == 0) {
     hr_12 = 12;
@@ -545,23 +796,23 @@ void drawAlarmScreen() {
   else {
     hr_12 = hr_24 % 12;
   };
-  if (alarmSettings[0] > 12) {
+  if (alarm.Hours > 12) {
     AM_PM = "PM";
   }
-  sprintf(buff, "%2d:%02i %2s", hr_12, alarmSettings[1], AM_PM);
+  sprintf(buff, " %2d:%02i %2s", hr_12, alarm.Hours, AM_PM);
 
   String timeNow = String(buff);
   tft.drawString(timeNow, 120, 53);
   drawSeparator(130);
   tft.setFreeFont(&FreeSans12pt7b);
   tft.setTextPadding(tft.textWidth(" Mm "));  // String width + margin
-  drawWeekday("Su", 30, 80, alarmSettings[3]);
-  drawWeekday("Mo", 90, 80, alarmSettings[4]);
-  drawWeekday("Tu", 150, 80, alarmSettings[5]);
-  drawWeekday("We", 210, 80, alarmSettings[6]);
-  drawWeekday("Th", 60, 110, alarmSettings[7]);
-  drawWeekday("Fr", 120, 110, alarmSettings[8]);
-  drawWeekday("Sa", 180, 110, alarmSettings[9]);
+  drawWeekday("Su", 30, 80, alarm.Sunday);
+  drawWeekday("Mo", 90, 80, alarm.Monday);
+  drawWeekday("Tu", 150, 80, alarm.Tuesday);
+  drawWeekday("We", 210, 80, alarm.Wednesday);
+  drawWeekday("Th", 60, 110, alarm.Thursday);
+  drawWeekday("Fr", 120, 110, alarm.Friday);
+  drawWeekday("Sa", 180, 110, alarm.Saturday);
 }
 
 void drawWeekday(String day, int x, int y, int setting) {
@@ -616,7 +867,7 @@ int splitIndex(String text)
 }
 
 // Calculate coord delta from start of text String to start of sub String contained within that text
-// Can be used to vertically right align text so for example a colon ":" in the time value is always
+// Can be used to vertically right align text so for example a colon " : " in the time value is always
 // plotted at same point on the screen irrespective of different proportional character widths,
 // could also be used to align decimal points for neat formatting
 int rightOffset(String text, String sub)
@@ -626,7 +877,7 @@ int rightOffset(String text, String sub)
 }
 
 // Calculate coord delta from start of text String to start of sub String contained within that text
-// Can be used to vertically left align text so for example a colon ":" in the time value is always
+// Can be used to vertically left align text so for example a colon " : " in the time value is always
 // plotted at same point on the screen irrespective of different proportional character widths,
 // could also be used to align decimal points for neat formatting
 int leftOffset(String text, String sub)
@@ -665,48 +916,35 @@ void fillSegment(int x, int y, int start_angle, int sub_angle, int r, unsigned i
 }
 
 time_t getTime() {
-  WiFiClient client;
-  if (!client.connect("api.timezonedb.com", 80)) {
-    return 0;
-  }
-  //  String URL = "GET /v2/get-time-zone?key=" + _timeZone + AY0H14VE80X2&format=json&by=zone&zone=" + _apiKey
-  client.print("GET /v2/get-time-zone?key=" + String(_apiKey) + "&format=json&by=zone&zone=");
-  client.print(_timeZone);
-  client.print(" HTTP/1.1\r\n");
-  client.print("Host: api.timezonedb.com\r\n");
-  client.print("Connection: close\r\n");
-  client.println();
-  unsigned long timeout = millis();
-  while (client.available() == 0) {
-    if (millis() - timeout > 5000) {
-      client.stop();
-      return 0;
+  HTTPClient http;
+  String payload;
+
+  // configure traged server and url
+  http.begin("http://api.timezonedb.com/v2/get-time-zone?key=AY0H14VE80X2&format=json&by=zone&zone=America/Detroit"); //HTTP
+
+  // start connection and send HTTP header
+  int httpCode = http.GET();
+
+  // httpCode will be negative on error
+  if (httpCode > 0) {
+    // HTTP header has been send and Server response header has been handled
+    Serial.printf("[HTTP] GET... code: %d\n", httpCode);
+
+    // file found at server
+    if (httpCode == HTTP_CODE_OK) {
+      payload = http.getString();
+      Serial.println(payload);
     }
+  } else {
+    Serial.printf("[HTTP] GET... failed, error: %s\n", http.errorToString(httpCode).c_str());
   }
 
-  // Check HTTP status
-  char status[32] = {0};
-  client.readBytesUntil('\r', status, sizeof(status));
-  if (strcmp(status, "HTTP/1.1 200 OK") != 0) {
-    return 0;
-  }
-
-  // Skip HTTP headers
-  char endOfHeaders[] = "\r\n\r\n";
-  if (!client.find(endOfHeaders)) {
-    return 0;
-  }
-
-  //skip extra characters
-  if (client.available()) {
-    client.readStringUntil('\r');
-  }
-
+  http.end();
   // Allocate JsonBuffer
   // Use arduinojson.org/assistant to compute the capacity.
   DynamicJsonBuffer jsonBuffer;
   // Parse JSON object
-  JsonObject& root = jsonBuffer.parseObject(client);
+  JsonObject& root = jsonBuffer.parseObject(payload);
   if (!root.success()) {
     return 0;
   }
@@ -830,8 +1068,8 @@ void updateData() {
   else fillSegment(22, 22, 0, (int) (70 * 3.6), 16, TFT_NAVY);
 
   wunderground.updateForecast(WUNDERGRROUND_API_KEY, WUNDERGRROUND_LANGUAGE, WUNDERGROUND_COUNTRY, WUNDERGROUND_CITY);
-  if (booted) drawProgress(90, "Updating astronomy...");
-  else fillSegment(22, 22, 0, (int) (90 * 3.6), 16, TFT_NAVY);
+  // if (booted) drawProgress(90, "Updating astronomy...");
+  // else fillSegment(22, 22, 0, (int) (90 * 3.6), 16, TFT_NAVY);
 
   //wunderground.updateAstronomy(WUNDERGRROUND_API_KEY, WUNDERGRROUND_LANGUAGE, WUNDERGROUND_COUNTRY, WUNDERGROUND_CITY);
   // lastUpdate = timeClient.getFormattedTime();
@@ -845,10 +1083,14 @@ void updateData() {
   else   fillSegment(22, 22, 0, 360, 22, TFT_BLACK);
 
   //tft.fillScreen(TFT_CYAN); // For text padding and update graphics over-write checking only
+  yield();
   drawTime();
+
   drawCurrentWeather();
   drawForecast();
+  yield();
   //drawAstronomy();
+  yield();
   drawalarmSetupButton();
   booted = false;
 }
@@ -866,3 +1108,61 @@ void drawProgress(uint8_t percentage, String text) {
 
   tft.setTextPadding(0);
 }
+
+void writeAlarmsFile() {
+  //  Serial.printf("update file settings heap size: %u\n", ESP.getFreeHeap());
+  if (SPIFFS.exists("/alarm.json")) {
+    if (SPIFFS.exists("/alarm.old")) {
+      SPIFFS.remove("/alarm.old");
+    }
+    SPIFFS.rename("/alarm.json", "/alarm.old");
+    SPIFFS.remove("/alarm.json");
+  }
+
+  DynamicJsonBuffer jsonBuffer;
+  JsonObject& json = jsonBuffer.createObject();
+  json["enabled"] = alarm.Enabled;
+  json["hour"] = alarm.Hours;
+  json["minute"] = alarm.Minutes ;
+  json["monday"] = alarm.Monday;
+  json["tuesday"] = alarm.Tuesday;
+  json["wednesday"] = alarm.Wednesday;
+  json["thursday"] = alarm.Thursday;
+  json["friday"] = alarm.Friday;
+  json["saturday"] = alarm.Saturday;
+  json["sunday"] = alarm.Sunday;
+
+  fs::File configFile = SPIFFS.open("/alarm.json", "w");
+  if (!configFile) {
+    Serial.println("failed to open config file for writing");
+  }
+
+  json.printTo(Serial);
+  json.printTo(configFile);
+  Serial.println("");
+  configFile.close();
+  //end save
+  yield();
+
+}
+
+int correctDay() {
+  Serial.println(weekday());
+  switch (weekday()) {
+    case 1:
+      return alarm.Sunday;
+    case 2:
+      return alarm.Monday;
+    case 3:
+      return alarm.Tuesday;
+    case 4:
+      return alarm.Wednesday;
+    case 5:
+      return alarm.Thursday;
+    case 6:
+      return alarm.Friday;
+    case 7:
+      return alarm.Saturday;
+  }
+}
+
